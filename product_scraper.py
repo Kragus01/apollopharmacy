@@ -25,6 +25,7 @@ PAGE_SIZE = 24
 DISCOUNT_THRESHOLD = 50.0
 REQUEST_TIMEOUT = 40
 REQUEST_GAP_SECONDS = (1.2, 2.0)
+MAX_REQUEST_ATTEMPTS = 5
 
 CSV_HEADERS = [
     "Product ID",
@@ -48,6 +49,14 @@ os.environ.setdefault("SCRAPER_NETWORK_GUARD", "1")
 
 import shared_network_guard  # noqa: E402,F401
 from shared_config import shared_location  # noqa: E402
+from shared_network_guard import (  # noqa: E402
+    ConsecutiveNetworkFailureLimit,
+    reset_failure_counter,
+)
+
+
+class CategoryRequestAborted(Exception):
+    """Raised when the shared guard reaches its consecutive-failure limit."""
 
 
 GRAPHQL_QUERY = """query getAplCategoryProducts($categoryId: Int, $axdcCode: String, $composition: String, $skus: String, $category_url: String, $page_id: Int, $filters: JSON, $sort_by: String, $lat: Float, $lng: Float, $size: Int, $pincode: String) {
@@ -123,14 +132,33 @@ def request_page(
         "size": PAGE_SIZE,
         "pincode": str(location["pincode"]),
     }
-    response = session.post(
-        API_URL,
-        headers=build_headers(token, category),
-        json={"operationName": "getAplCategoryProducts", "variables": variables, "query": GRAPHQL_QUERY},
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    payload = response.json()
+    payload: dict[str, Any] | None = None
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        try:
+            response = session.post(
+                API_URL,
+                headers=build_headers(token, category),
+                json={"operationName": "getAplCategoryProducts", "variables": variables, "query": GRAPHQL_QUERY},
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            break
+        except ConsecutiveNetworkFailureLimit as error:
+            raise CategoryRequestAborted(str(error)) from error
+        except requests.RequestException as error:
+            status = error.response.status_code if error.response is not None else None
+            if attempt >= MAX_REQUEST_ATTEMPTS:
+                raise
+            print(
+                f"HTTP/network failure for {category.get('name', category['slug'])} page {page_id} "
+                f"(attempt {attempt}/{MAX_REQUEST_ATTEMPTS}, status={status}); retrying after shared wait.",
+                flush=True,
+            )
+        except ValueError:
+            raise
+    if payload is None:
+        raise RuntimeError(f"No Apollo response for {category['slug']} page {page_id}")
     result = (payload.get("data") or {}).get("getAplCategoryProducts")
     if not isinstance(result, dict):
         errors = payload.get("errors") or []
@@ -208,7 +236,12 @@ def scrape_category(
     location: dict[str, Any],
     token: str,
 ) -> list[dict[str, str]]:
-    first = request_page(session, category, location, token, 1)
+    try:
+        first = request_page(session, category, location, token, 1)
+    except CategoryRequestAborted as error:
+        reset_failure_counter()
+        print(f"Skipping {category.get('name', category['slug'])} after consecutive request failures: {error}", flush=True)
+        return []
     total_count = int(first.get("count") or 0)
     page_count = max(1, math.ceil(total_count / PAGE_SIZE))
     rows: list[dict[str, str]] = []
@@ -217,7 +250,16 @@ def scrape_category(
 
     for page_id in range(2, page_count + 1):
         time.sleep(random.uniform(*REQUEST_GAP_SECONDS))
-        page_payloads.append((page_id, request_page(session, category, location, token, page_id)))
+        try:
+            page_payloads.append((page_id, request_page(session, category, location, token, page_id)))
+        except CategoryRequestAborted as error:
+            reset_failure_counter()
+            print(
+                f"Stopping {category.get('name', category['slug'])} at page {page_id} "
+                f"after consecutive request failures: {error}",
+                flush=True,
+            )
+            break
 
     for page_id, payload in page_payloads:
         products = payload.get("products") or []
