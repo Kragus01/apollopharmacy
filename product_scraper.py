@@ -5,8 +5,10 @@ import json
 import math
 import os
 import random
+import secrets
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -105,14 +107,48 @@ def get_auth_token(config: dict[str, Any]) -> str:
     return token.strip()
 
 
+def get_location(config: dict[str, Any]) -> dict[str, Any]:
+    if os.environ.get("SCRAPER_LOCATION_OVERRIDE") == "1":
+        return shared_location(config)
+
+    project_location = config.get("location")
+    if isinstance(project_location, dict) and all(
+        project_location.get(key) not in (None, "") for key in ("lat", "lon", "pincode")
+    ):
+        return {
+            "lat": project_location["lat"],
+            "lon": project_location["lon"],
+            "lng": project_location["lon"],
+            "pincode": project_location["pincode"],
+        }
+    return shared_location()
+
+
 def build_headers(token: str, category: dict[str, str]) -> dict[str, str]:
+    trace_id = uuid.uuid4().hex
+    span_id = secrets.token_hex(8)
     return {
-        "Accept": "application/json",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
         "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "DNT": "1",
         "Origin": "https://www.apollopharmacy.in",
+        "Pragma": "no-cache",
+        "Priority": "u=1, i",
         "Referer": category.get("url") or f"https://www.apollopharmacy.in/shop-by-category/{category['slug']}",
+        "Sec-CH-UA": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
         "Authorization": token,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+        "X-Correlation-Id": "null",
+        "X-Device-Id": "8a7f3eb3-4717-4124-bc9a-e34a5d5cd9f8",
+        "Traceparent": f"00-{trace_id}-{span_id}-00",
     }
 
 
@@ -298,7 +334,7 @@ def main() -> int:
         threshold = DISCOUNT_THRESHOLD
     DISCOUNT_THRESHOLD = threshold
     token = get_auth_token(config)
-    location = shared_location()
+    location = get_location(config)
     if not all(location.get(key) not in (None, "") for key in ("lat", "lon", "pincode")):
         raise RuntimeError("Shared location must provide lat, lon, and pincode for Apollo Pharmacy.")
 
