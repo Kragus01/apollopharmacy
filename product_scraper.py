@@ -22,12 +22,14 @@ CATEGORIES_PATH = EXTRACTED_DIR / "categories.json"
 OUTPUT_PATH = EXTRACTED_DIR / "apollopharmacy_products.csv"
 CONFIG_PATH = PROJECT_DIR / "config.json"
 API_URL = "https://api.apollo247.com/"
+AUTH_URL = "https://apigateway.apollo247.in/auth-service/fetchAuthToken"
 PRODUCT_URL_BASE = "https://www.apollopharmacy.in/otc/"
 PAGE_SIZE = 24
 DISCOUNT_THRESHOLD = 50.0
 REQUEST_TIMEOUT = 40
 REQUEST_GAP_SECONDS = (1.2, 2.0)
 MAX_REQUEST_ATTEMPTS = 5
+HTTP_429_PAUSES = (10.0, 20.0, 20.0, 20.0, 20.0)
 
 CSV_HEADERS = [
     "Product ID",
@@ -152,11 +154,67 @@ def build_headers(token: str, category: dict[str, str]) -> dict[str, str]:
     }
 
 
+def build_auth_headers(bootstrap_token: str, category: dict[str, str]) -> dict[str, str]:
+    headers = build_headers(bootstrap_token, category)
+    headers.update(
+        {
+            "Accept": "application/json, text/plain, */*",
+            "Sec-Fetch-Storage-Access": "active",
+        }
+    )
+    headers.pop("Content-Type", None)
+    headers.pop("X-Correlation-Id", None)
+    headers.pop("Traceparent", None)
+    return headers
+
+
+def extract_fresh_token(auth_data: Any) -> str | None:
+    if not isinstance(auth_data, dict):
+        return None
+    candidates = [auth_data]
+    for key in ("data", "result"):
+        nested = auth_data.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    for candidate in candidates:
+        for key in ("token", "access_token", "accessToken"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def refresh_auth_token(
+    session: requests.Session,
+    category: dict[str, str],
+    bootstrap_token: str,
+    current_token: str,
+) -> str:
+    try:
+        response = session.get(
+            AUTH_URL,
+            headers=build_auth_headers(bootstrap_token, category),
+            timeout=REQUEST_TIMEOUT,
+        )
+        if response.status_code != 200:
+            print(f"Apollo auth refresh returned HTTP {response.status_code}; retrying with current token.", flush=True)
+            return current_token
+        fresh_token = extract_fresh_token(response.json())
+        if not fresh_token:
+            print("Apollo auth refresh had no recognized token field; retaining current token.", flush=True)
+            return current_token
+        print("Apollo auth token refreshed successfully.", flush=True)
+        return fresh_token
+    except (requests.RequestException, ValueError) as error:
+        print(f"Apollo auth refresh failed ({type(error).__name__}); retrying with current token.", flush=True)
+        return current_token
+
+
 def request_page(
     session: requests.Session,
     category: dict[str, str],
     location: dict[str, Any],
-    token: str,
+    auth_state: dict[str, str],
     page_id: int,
 ) -> dict[str, Any]:
     variables = {
@@ -169,17 +227,38 @@ def request_page(
         "pincode": str(location["pincode"]),
     }
     payload: dict[str, Any] | None = None
+    bootstrap_token = auth_state["bootstrap"]
     for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
         try:
             response = session.post(
                 API_URL,
-                headers=build_headers(token, category),
+                headers=build_headers(auth_state["token"], category),
                 json={"operationName": "getAplCategoryProducts", "variables": variables, "query": GRAPHQL_QUERY},
                 timeout=REQUEST_TIMEOUT,
             )
+            if response.status_code in {400, 429}:
+                if attempt >= MAX_REQUEST_ATTEMPTS:
+                    raise CategoryRequestAborted(
+                        f"Apollo page {page_id} remained HTTP {response.status_code} after {attempt} attempts"
+                    )
+                print(
+                    f"Apollo page {page_id} returned HTTP {response.status_code}; refreshing auth before retry "
+                    f"({attempt}/{MAX_REQUEST_ATTEMPTS}).",
+                    flush=True,
+                )
+                auth_state["token"] = refresh_auth_token(
+                    session, category, bootstrap_token, auth_state["token"]
+                )
+                if response.status_code == 429:
+                    time.sleep(HTTP_429_PAUSES[min(attempt - 1, len(HTTP_429_PAUSES) - 1)])
+                else:
+                    time.sleep(random.uniform(*REQUEST_GAP_SECONDS))
+                continue
             response.raise_for_status()
             payload = response.json()
             break
+        except CategoryRequestAborted:
+            raise
         except ConsecutiveNetworkFailureLimit as error:
             raise CategoryRequestAborted(str(error)) from error
         except requests.RequestException as error:
@@ -270,10 +349,10 @@ def scrape_category(
     session: requests.Session,
     category: dict[str, str],
     location: dict[str, Any],
-    token: str,
+    auth_state: dict[str, str],
 ) -> list[dict[str, str]]:
     try:
-        first = request_page(session, category, location, token, 1)
+        first = request_page(session, category, location, auth_state, 1)
     except CategoryRequestAborted as error:
         reset_failure_counter()
         print(f"Skipping {category.get('name', category['slug'])} after consecutive request failures: {error}", flush=True)
@@ -287,7 +366,7 @@ def scrape_category(
     for page_id in range(2, page_count + 1):
         time.sleep(random.uniform(*REQUEST_GAP_SECONDS))
         try:
-            page_payloads.append((page_id, request_page(session, category, location, token, page_id)))
+            page_payloads.append((page_id, request_page(session, category, location, auth_state, page_id)))
         except CategoryRequestAborted as error:
             reset_failure_counter()
             print(
@@ -334,6 +413,7 @@ def main() -> int:
         threshold = DISCOUNT_THRESHOLD
     DISCOUNT_THRESHOLD = threshold
     token = get_auth_token(config)
+    auth_state = {"bootstrap": token, "token": token}
     location = get_location(config)
     if not all(location.get(key) not in (None, "") for key in ("lat", "lon", "pincode")):
         raise RuntimeError("Shared location must provide lat, lon, and pincode for Apollo Pharmacy.")
@@ -347,7 +427,7 @@ def main() -> int:
         for index, category in enumerate(categories, start=1):
             name = str(category.get("name") or category["slug"])
             print(f"\n[{index}/{len(categories)}] Scraping {name} ({category['slug']})", flush=True)
-            rows = scrape_category(session, category, location, token)
+            rows = scrape_category(session, category, location, auth_state)
             all_rows.extend(rows)
             print(f"{name}: qualifying products={len(rows)}", flush=True)
 
