@@ -67,7 +67,8 @@ def main() -> int:
     print("Starting Apollo Pharmacy category extraction...\n", flush=True)
     cleanup()
     run_step("categories.py")
-    print("\nApollo Pharmacy category extraction completed.", flush=True)
+    run_step("product_scraper.py")
+    print("\nApollo Pharmacy extraction completed.", flush=True)
     return 0
 
 
