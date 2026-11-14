@@ -198,7 +198,10 @@ def refresh_auth_token(
             timeout=REQUEST_TIMEOUT,
         )
         if response.status_code != 200:
-            print(f"Apollo auth refresh returned HTTP {response.status_code}; retrying with current token.", flush=True)
+            print(
+                f"Apollo auth refresh returned HTTP {response.status_code}; retaining current token.",
+                flush=True,
+            )
             return current_token
         fresh_token = extract_fresh_token(response.json())
         if not fresh_token:
@@ -247,12 +250,14 @@ def request_page(
                     f"({attempt}/{MAX_REQUEST_ATTEMPTS}).",
                     flush=True,
                 )
+                if response.status_code == 429:
+                    pause = HTTP_429_PAUSES[min(attempt - 1, len(HTTP_429_PAUSES) - 1)]
+                    print(f"Waiting {pause:.0f}s before Apollo auth refresh and page retry.", flush=True)
+                    time.sleep(pause)
                 auth_state["token"] = refresh_auth_token(
                     session, category, bootstrap_token, auth_state["token"]
                 )
-                if response.status_code == 429:
-                    time.sleep(HTTP_429_PAUSES[min(attempt - 1, len(HTTP_429_PAUSES) - 1)])
-                else:
+                if response.status_code != 429:
                     time.sleep(random.uniform(*REQUEST_GAP_SECONDS))
                 continue
             response.raise_for_status()
@@ -421,13 +426,32 @@ def run_sample_payload_test() -> int:
         "pincode": "421201",
     }
     with requests.Session() as session:
-        result = request_page(session, category, location, auth_state, 1)
-    products = result.get("products") or []
-    print(
-        f"Sample payload succeeded: category=baby-care page=1 "
-        f"count={result.get('count')} products_in_page={len(products)}",
-        flush=True,
-    )
+        try:
+            first = request_page(session, category, location, auth_state, 1)
+        except CategoryRequestAborted as error:
+            print(f"Sample payload test stopped at page 1: {error}", flush=True)
+            return 2
+        total_count = int(first.get("count") or 0)
+        page_count = max(1, math.ceil(total_count / PAGE_SIZE))
+        first_products = first.get("products") or []
+        print(
+            f"Sample payload succeeded: category=baby-care page=1/{page_count} "
+            f"count={total_count} products_in_page={len(first_products)}",
+            flush=True,
+        )
+        for page_id in range(2, page_count + 1):
+            time.sleep(random.uniform(*REQUEST_GAP_SECONDS))
+            try:
+                result = request_page(session, category, location, auth_state, page_id)
+            except CategoryRequestAborted as error:
+                print(f"Sample payload test stopped at page {page_id}: {error}", flush=True)
+                return 2
+            products = result.get("products") or []
+            print(
+                f"Sample payload succeeded: category=baby-care page={page_id}/{page_count} "
+                f"products_in_page={len(products)}",
+                flush=True,
+            )
     return 0
 
 
