@@ -156,7 +156,7 @@ def build_headers(token: str, category: dict[str, str]) -> dict[str, str]:
 
 
 def warm_category_page(session: requests.Session, category: dict[str, str], product_page_id: int) -> None:
-    page_number = product_page_id + 1 if product_page_id > 1 else None
+    page_number = product_page_id if product_page_id > 1 else None
     page_url = category.get("url") or f"https://www.apollopharmacy.in/shop-by-category/{category['slug']}"
     params = {"_rsc": secrets.token_urlsafe(12)}
     next_url = f"/shop-by-category/{category['slug']}"
@@ -241,7 +241,7 @@ def request_page(
                         f"Apollo page {page_id} remained HTTP {response.status_code} after {attempt} attempts"
                     )
                 print(
-                    f"Apollo page {page_id} returned HTTP {response.status_code}; retrying with configured auth "
+                    f"Apollo page {page_id} returned HTTP {response.status_code}; retrying same request "
                     f"({attempt}/{MAX_REQUEST_ATTEMPTS}).",
                     flush=True,
                 )
