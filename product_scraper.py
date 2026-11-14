@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import math
@@ -405,7 +406,41 @@ def scrape_category(
     return rows
 
 
+def run_sample_payload_test() -> int:
+    token = get_auth_token(load_config())
+    auth_state = {"bootstrap": token, "token": token}
+    category = {
+        "name": "Baby Care payload test",
+        "slug": "baby-care",
+        "url": "https://www.apollopharmacy.in/shop-by-category/baby-care",
+    }
+    location = {
+        "lat": 19.223647947149935,
+        "lon": 73.10226382004917,
+        "lng": 73.10226382004917,
+        "pincode": "421201",
+    }
+    with requests.Session() as session:
+        result = request_page(session, category, location, auth_state, 1)
+    products = result.get("products") or []
+    print(
+        f"Sample payload succeeded: category=baby-care page=1 "
+        f"count={result.get('count')} products_in_page={len(products)}",
+        flush=True,
+    )
+    return 0
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Scrape Apollo Pharmacy discounted products.")
+    parser.add_argument(
+        "--test-payload",
+        action="store_true",
+        help="Send only the supplied baby-care page 1 sample request.",
+    )
+    if parser.parse_args().test_payload:
+        return run_sample_payload_test()
+
     global DISCOUNT_THRESHOLD
     config = load_config()
     threshold = numeric(config.get("discount_threshold"))
