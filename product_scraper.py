@@ -23,7 +23,6 @@ CATEGORIES_PATH = EXTRACTED_DIR / "categories.json"
 OUTPUT_PATH = EXTRACTED_DIR / "apollopharmacy_products.csv"
 CONFIG_PATH = PROJECT_DIR / "config.json"
 API_URL = "https://api.apollo247.com/"
-RSC_QUERY_VALUE = "4W0iNb-5p9A3XYAO"
 PRODUCT_URL_BASE = "https://www.apollopharmacy.in/otc/"
 PAGE_SIZE = 24
 DISCOUNT_THRESHOLD = 50.0
@@ -85,6 +84,7 @@ GRAPHQL_QUERY = """query getAplCategoryProducts($categoryId: Int, $axdcCode: Str
     __typename
   }
 }"""
+GRAPHQL_QUERY += "\n"
 
 
 def load_config() -> dict[str, Any]:
@@ -156,33 +156,41 @@ def build_headers(token: str, category: dict[str, str]) -> dict[str, str]:
 
 
 def warm_category_page(session: requests.Session, category: dict[str, str], product_page_id: int) -> None:
-    page_number = product_page_id + 1
+    page_number = product_page_id + 1 if product_page_id > 1 else None
     page_url = category.get("url") or f"https://www.apollopharmacy.in/shop-by-category/{category['slug']}"
+    params = {"_rsc": secrets.token_urlsafe(12)}
+    next_url = f"/shop-by-category/{category['slug']}"
+    if page_number is not None:
+        params["page"] = page_number
+        next_url += f"?page={page_number}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
         "Accept": "text/x-component",
         "RSC": "1",
         "Referer": f"https://www.apollopharmacy.in/shop-by-category/{category['slug']}",
-        "Next-Url": f"/shop-by-category/{category['slug']}?page={page_number}",
+        "Next-Url": next_url,
     }
     try:
         response = session.get(
             page_url,
-            params={"page": page_number, "_rsc": RSC_QUERY_VALUE},
+            params=params,
             headers=headers,
             timeout=REQUEST_TIMEOUT,
         )
         if response.status_code == 200:
-            print(f"Apollo category page context GET page={page_number}: HTTP 200", flush=True)
+            label = f"page={page_number}" if page_number is not None else "initial page"
+            print(f"Apollo category page context GET {label}: HTTP 200", flush=True)
         else:
+            label = f"page={page_number}" if page_number is not None else "initial page"
             print(
-                f"Apollo category page context GET page={page_number}: HTTP {response.status_code}; "
+                f"Apollo category page context GET {label}: HTTP {response.status_code}; "
                 "continuing with product POST.",
                 flush=True,
             )
     except (requests.RequestException, ConsecutiveNetworkFailureLimit) as error:
+        label = f"page={page_number}" if page_number is not None else "initial page"
         print(
-            f"Apollo category page context GET page={page_number} failed ({type(error).__name__}); "
+            f"Apollo category page context GET {label} failed ({type(error).__name__}); "
             "continuing with product POST.",
             flush=True,
         )
@@ -209,10 +217,11 @@ def request_page(
     for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
         try:
             body = {"operationName": "getAplCategoryProducts", "variables": variables, "query": GRAPHQL_QUERY}
+            body_bytes = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
             headers = build_headers(token, category)
             if verbose:
                 prepared = session.prepare_request(
-                    requests.Request("POST", API_URL, headers=headers, json=body)
+                    requests.Request("POST", API_URL, headers=headers, data=body_bytes)
                 )
                 print(f"\nPOST URL: {prepared.url}", flush=True)
                 print("POST headers:", json.dumps(dict(prepared.headers), indent=2), flush=True)
@@ -225,7 +234,7 @@ def request_page(
                     timeout=REQUEST_TIMEOUT,
                 )
             else:
-                response = session.post(API_URL, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+                response = session.post(API_URL, headers=headers, data=body_bytes, timeout=REQUEST_TIMEOUT)
             if response.status_code in {400, 429}:
                 if attempt >= MAX_REQUEST_ATTEMPTS:
                     raise CategoryRequestAborted(
