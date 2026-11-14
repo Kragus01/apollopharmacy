@@ -335,11 +335,18 @@ def product_to_row(product: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def save_rows(rows: list[dict[str, str]]) -> None:
+def initialize_output() -> None:
     EXTRACTED_DIR.mkdir(parents=True, exist_ok=True)
     with OUTPUT_PATH.open("w", newline="", encoding="utf-8-sig") as file:
         writer = csv.DictWriter(file, fieldnames=CSV_HEADERS, extrasaction="ignore")
         writer.writeheader()
+
+
+def append_rows(rows: list[dict[str, str]]) -> None:
+    if not rows:
+        return
+    with OUTPUT_PATH.open("a", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=CSV_HEADERS, extrasaction="ignore")
         writer.writerows(rows)
 
 
@@ -348,41 +355,41 @@ def scrape_category(
     category: dict[str, str],
     location: dict[str, Any],
     token: str,
-) -> list[dict[str, str]]:
+) -> int:
     try:
         warm_category_page(session, category, 1)
         first = request_page(session, category, location, token, 1)
     except CategoryRequestAborted as error:
         reset_failure_counter()
         print(f"Skipping {category.get('name', category['slug'])} after consecutive request failures: {error}", flush=True)
-        return []
+        return 0
     total_count = int(first.get("count") or 0)
     page_count = max(1, math.ceil(total_count / PAGE_SIZE))
-    rows: list[dict[str, str]] = []
+    category_rows = 0
     seen: set[str] = set()
-    page_payloads = [(1, first)]
-
-    for page_id in range(2, page_count + 1):
-        time.sleep(random.uniform(*REQUEST_GAP_SECONDS))
-        try:
-            warm_category_page(session, category, page_id)
-            page_payloads.append((page_id, request_page(session, category, location, token, page_id)))
-        except CategoryRequestAborted as error:
-            reset_failure_counter()
-            print(
-                f"Stopping {category.get('name', category['slug'])} at page {page_id} "
-                f"after consecutive request failures: {error}",
-                flush=True,
-            )
-            break
-
-    for page_id, payload in page_payloads:
+    for page_id in range(1, page_count + 1):
+        if page_id == 1:
+            payload = first
+        else:
+            time.sleep(random.uniform(*REQUEST_GAP_SECONDS))
+            try:
+                warm_category_page(session, category, page_id)
+                payload = request_page(session, category, location, token, page_id)
+            except CategoryRequestAborted as error:
+                reset_failure_counter()
+                print(
+                    f"Stopping {category.get('name', category['slug'])} at page {page_id} "
+                    f"after consecutive request failures: {error}",
+                    flush=True,
+                )
+                break
         products = payload.get("products") or []
         if not isinstance(products, list):
             print(f"{category.get('name', category['slug'])}: malformed product list on page {page_id}; skipping page")
             continue
         accepted = 0
         below_threshold = 0
+        rows: list[dict[str, str]] = []
         for product in products:
             if not isinstance(product, dict):
                 continue
@@ -397,12 +404,14 @@ def scrape_category(
             seen.add(key)
             rows.append(row)
             accepted += 1
+        append_rows(rows)
+        category_rows += accepted
         print(
             f"{category.get('name', category['slug'])} | page {page_id}/{page_count} | "
             f"products={len(products)} | >=50%={accepted} | below threshold={below_threshold}",
             flush=True,
         )
-    return rows
+    return category_rows
 
 
 def run_sample_payload_test(verbose: bool = False) -> int:
@@ -483,17 +492,17 @@ def main() -> int:
     if not categories:
         raise RuntimeError(f"No categories found in {CATEGORIES_PATH}")
 
-    all_rows: list[dict[str, str]] = []
+    initialize_output()
+    total_rows = 0
     with requests.Session() as session:
         for index, category in enumerate(categories, start=1):
             name = str(category.get("name") or category["slug"])
             print(f"\n[{index}/{len(categories)}] Scraping {name} ({category['slug']})", flush=True)
-            rows = scrape_category(session, category, location, token)
-            all_rows.extend(rows)
-            print(f"{name}: qualifying products={len(rows)}", flush=True)
+            rows_written = scrape_category(session, category, location, token)
+            total_rows += rows_written
+            print(f"{name}: qualifying products={rows_written}", flush=True)
 
-    save_rows(all_rows)
-    print(f"Saved {len(all_rows)} unique products to: {OUTPUT_PATH}", flush=True)
+    print(f"Saved {total_rows} products incrementally to: {OUTPUT_PATH}", flush=True)
     return 0
 
 
