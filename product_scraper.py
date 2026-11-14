@@ -24,6 +24,7 @@ OUTPUT_PATH = EXTRACTED_DIR / "apollopharmacy_products.csv"
 CONFIG_PATH = PROJECT_DIR / "config.json"
 API_URL = "https://api.apollo247.com/"
 AUTH_URL = "https://apigateway.apollo247.in/auth-service/fetchAuthToken"
+RSC_QUERY_VALUE = "4W0iNb-5p9A3XYAO"
 PRODUCT_URL_BASE = "https://www.apollopharmacy.in/otc/"
 PAGE_SIZE = 24
 DISCOUNT_THRESHOLD = 50.0
@@ -167,6 +168,39 @@ def build_auth_headers(bootstrap_token: str, category: dict[str, str]) -> dict[s
     headers.pop("X-Correlation-Id", None)
     headers.pop("Traceparent", None)
     return headers
+
+
+def warm_category_page(session: requests.Session, category: dict[str, str], product_page_id: int) -> None:
+    page_number = product_page_id + 1
+    page_url = category.get("url") or f"https://www.apollopharmacy.in/shop-by-category/{category['slug']}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+        "Accept": "text/x-component",
+        "RSC": "1",
+        "Referer": f"https://www.apollopharmacy.in/shop-by-category/{category['slug']}",
+        "Next-Url": f"/shop-by-category/{category['slug']}?page={page_number}",
+    }
+    try:
+        response = session.get(
+            page_url,
+            params={"page": page_number, "_rsc": RSC_QUERY_VALUE},
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if response.status_code == 200:
+            print(f"Apollo category page context GET page={page_number}: HTTP 200", flush=True)
+        else:
+            print(
+                f"Apollo category page context GET page={page_number}: HTTP {response.status_code}; "
+                "continuing with product POST.",
+                flush=True,
+            )
+    except (requests.RequestException, ConsecutiveNetworkFailureLimit) as error:
+        print(
+            f"Apollo category page context GET page={page_number} failed ({type(error).__name__}); "
+            "continuing with product POST.",
+            flush=True,
+        )
 
 
 def extract_fresh_token(auth_data: Any) -> str | None:
@@ -372,6 +406,7 @@ def scrape_category(
     for page_id in range(2, page_count + 1):
         time.sleep(random.uniform(*REQUEST_GAP_SECONDS))
         try:
+            warm_category_page(session, category, page_id)
             page_payloads.append((page_id, request_page(session, category, location, auth_state, page_id)))
         except CategoryRequestAborted as error:
             reset_failure_counter()
@@ -442,6 +477,7 @@ def run_sample_payload_test() -> int:
         for page_id in range(2, page_count + 1):
             time.sleep(random.uniform(*REQUEST_GAP_SECONDS))
             try:
+                warm_category_page(session, category, page_id)
                 result = request_page(session, category, location, auth_state, page_id)
             except CategoryRequestAborted as error:
                 print(f"Sample payload test stopped at page {page_id}: {error}", flush=True)
