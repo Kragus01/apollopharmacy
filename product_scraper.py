@@ -155,47 +155,6 @@ def build_headers(token: str, category: dict[str, str]) -> dict[str, str]:
     }
 
 
-def warm_category_page(session: requests.Session, category: dict[str, str], product_page_id: int) -> None:
-    page_number = product_page_id if product_page_id > 1 else None
-    page_url = category.get("url") or f"https://www.apollopharmacy.in/shop-by-category/{category['slug']}"
-    params = {"_rsc": secrets.token_urlsafe(12)}
-    next_url = f"/shop-by-category/{category['slug']}"
-    if page_number is not None:
-        params["page"] = page_number
-        next_url += f"?page={page_number}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-        "Accept": "text/x-component",
-        "RSC": "1",
-        "Referer": f"https://www.apollopharmacy.in/shop-by-category/{category['slug']}",
-        "Next-Url": next_url,
-    }
-    try:
-        response = session.get(
-            page_url,
-            params=params,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-        )
-        if response.status_code == 200:
-            label = f"page={page_number}" if page_number is not None else "initial page"
-            print(f"Apollo category page context GET {label}: HTTP 200", flush=True)
-        else:
-            label = f"page={page_number}" if page_number is not None else "initial page"
-            print(
-                f"Apollo category page context GET {label}: HTTP {response.status_code}; "
-                "continuing with product POST.",
-                flush=True,
-            )
-    except (requests.RequestException, ConsecutiveNetworkFailureLimit) as error:
-        label = f"page={page_number}" if page_number is not None else "initial page"
-        print(
-            f"Apollo category page context GET {label} failed ({type(error).__name__}); "
-            "continuing with product POST.",
-            flush=True,
-        )
-
-
 def request_page(
     session: requests.Session,
     category: dict[str, str],
@@ -217,24 +176,19 @@ def request_page(
     for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
         try:
             body = {"operationName": "getAplCategoryProducts", "variables": variables, "query": GRAPHQL_QUERY}
-            body_bytes = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
             headers = build_headers(token, category)
             if verbose:
                 prepared = session.prepare_request(
-                    requests.Request("POST", API_URL, headers=headers, data=body_bytes)
+                    requests.Request("POST", API_URL, headers=headers, json=body)
                 )
                 print(f"\nPOST URL: {prepared.url}", flush=True)
-                print("POST headers:", json.dumps(dict(prepared.headers), indent=2), flush=True)
+                safe_headers = dict(prepared.headers)
+                safe_headers["Authorization"] = "<redacted>"
+                print("POST headers:", json.dumps(safe_headers, indent=2), flush=True)
                 print("POST JSON payload:", prepared.body.decode("utf-8") if isinstance(prepared.body, bytes) else prepared.body, flush=True)
-                response = session.request(
-                    "POST",
-                    prepared.url,
-                    headers=prepared.headers,
-                    data=prepared.body,
-                    timeout=REQUEST_TIMEOUT,
-                )
+                response = session.send(prepared, timeout=REQUEST_TIMEOUT)
             else:
-                response = session.post(API_URL, headers=headers, data=body_bytes, timeout=REQUEST_TIMEOUT)
+                response = session.post(API_URL, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
             if response.status_code in {400, 429}:
                 if attempt >= MAX_REQUEST_ATTEMPTS:
                     raise CategoryRequestAborted(
@@ -357,7 +311,6 @@ def scrape_category(
     token: str,
 ) -> int:
     try:
-        warm_category_page(session, category, 1)
         first = request_page(session, category, location, token, 1)
     except CategoryRequestAborted as error:
         reset_failure_counter()
@@ -373,7 +326,6 @@ def scrape_category(
         else:
             time.sleep(random.uniform(*REQUEST_GAP_SECONDS))
             try:
-                warm_category_page(session, category, page_id)
                 payload = request_page(session, category, location, token, page_id)
             except CategoryRequestAborted as error:
                 reset_failure_counter()
@@ -429,7 +381,6 @@ def run_sample_payload_test(verbose: bool = False) -> int:
     }
     with requests.Session() as session:
         try:
-            warm_category_page(session, category, 1)
             first = request_page(session, category, location, token, 1, verbose=verbose)
         except CategoryRequestAborted as error:
             print(f"Sample payload test stopped at page 1: {error}", flush=True)
@@ -445,7 +396,6 @@ def run_sample_payload_test(verbose: bool = False) -> int:
         for page_id in range(2, page_count + 1):
             time.sleep(random.uniform(*REQUEST_GAP_SECONDS))
             try:
-                warm_category_page(session, category, page_id)
                 result = request_page(session, category, location, token, page_id, verbose=verbose)
             except CategoryRequestAborted as error:
                 print(f"Sample payload test stopped at page {page_id}: {error}", flush=True)
