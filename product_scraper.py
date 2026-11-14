@@ -23,7 +23,6 @@ CATEGORIES_PATH = EXTRACTED_DIR / "categories.json"
 OUTPUT_PATH = EXTRACTED_DIR / "apollopharmacy_products.csv"
 CONFIG_PATH = PROJECT_DIR / "config.json"
 API_URL = "https://api.apollo247.com/"
-AUTH_URL = "https://apigateway.apollo247.in/auth-service/fetchAuthToken"
 RSC_QUERY_VALUE = "4W0iNb-5p9A3XYAO"
 PRODUCT_URL_BASE = "https://www.apollopharmacy.in/otc/"
 PAGE_SIZE = 24
@@ -156,20 +155,6 @@ def build_headers(token: str, category: dict[str, str]) -> dict[str, str]:
     }
 
 
-def build_auth_headers(bootstrap_token: str, category: dict[str, str]) -> dict[str, str]:
-    headers = build_headers(bootstrap_token, category)
-    headers.update(
-        {
-            "Accept": "application/json, text/plain, */*",
-            "Sec-Fetch-Storage-Access": "active",
-        }
-    )
-    headers.pop("Content-Type", None)
-    headers.pop("X-Correlation-Id", None)
-    headers.pop("Traceparent", None)
-    return headers
-
-
 def warm_category_page(session: requests.Session, category: dict[str, str], product_page_id: int) -> None:
     page_number = product_page_id + 1
     page_url = category.get("url") or f"https://www.apollopharmacy.in/shop-by-category/{category['slug']}"
@@ -203,57 +188,13 @@ def warm_category_page(session: requests.Session, category: dict[str, str], prod
         )
 
 
-def extract_fresh_token(auth_data: Any) -> str | None:
-    if not isinstance(auth_data, dict):
-        return None
-    candidates = [auth_data]
-    for key in ("data", "result"):
-        nested = auth_data.get(key)
-        if isinstance(nested, dict):
-            candidates.append(nested)
-    for candidate in candidates:
-        for key in ("token", "access_token", "accessToken"):
-            value = candidate.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return None
-
-
-def refresh_auth_token(
-    session: requests.Session,
-    category: dict[str, str],
-    bootstrap_token: str,
-    current_token: str,
-) -> str:
-    try:
-        response = session.get(
-            AUTH_URL,
-            headers=build_auth_headers(bootstrap_token, category),
-            timeout=REQUEST_TIMEOUT,
-        )
-        if response.status_code != 200:
-            print(
-                f"Apollo auth refresh returned HTTP {response.status_code}; retaining current token.",
-                flush=True,
-            )
-            return current_token
-        fresh_token = extract_fresh_token(response.json())
-        if not fresh_token:
-            print("Apollo auth refresh had no recognized token field; retaining current token.", flush=True)
-            return current_token
-        print("Apollo auth token refreshed successfully.", flush=True)
-        return fresh_token
-    except (requests.RequestException, ValueError) as error:
-        print(f"Apollo auth refresh failed ({type(error).__name__}); retrying with current token.", flush=True)
-        return current_token
-
-
 def request_page(
     session: requests.Session,
     category: dict[str, str],
     location: dict[str, Any],
-    auth_state: dict[str, str],
+    token: str,
     page_id: int,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     variables = {
         "category_url": category["slug"],
@@ -265,32 +206,40 @@ def request_page(
         "pincode": str(location["pincode"]),
     }
     payload: dict[str, Any] | None = None
-    bootstrap_token = auth_state["bootstrap"]
     for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
         try:
-            response = session.post(
-                API_URL,
-                headers=build_headers(auth_state["token"], category),
-                json={"operationName": "getAplCategoryProducts", "variables": variables, "query": GRAPHQL_QUERY},
-                timeout=REQUEST_TIMEOUT,
-            )
+            body = {"operationName": "getAplCategoryProducts", "variables": variables, "query": GRAPHQL_QUERY}
+            headers = build_headers(token, category)
+            if verbose:
+                prepared = session.prepare_request(
+                    requests.Request("POST", API_URL, headers=headers, json=body)
+                )
+                print(f"\nPOST URL: {prepared.url}", flush=True)
+                print("POST headers:", json.dumps(dict(prepared.headers), indent=2), flush=True)
+                print("POST JSON payload:", prepared.body.decode("utf-8") if isinstance(prepared.body, bytes) else prepared.body, flush=True)
+                response = session.request(
+                    "POST",
+                    prepared.url,
+                    headers=prepared.headers,
+                    data=prepared.body,
+                    timeout=REQUEST_TIMEOUT,
+                )
+            else:
+                response = session.post(API_URL, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
             if response.status_code in {400, 429}:
                 if attempt >= MAX_REQUEST_ATTEMPTS:
                     raise CategoryRequestAborted(
                         f"Apollo page {page_id} remained HTTP {response.status_code} after {attempt} attempts"
                     )
                 print(
-                    f"Apollo page {page_id} returned HTTP {response.status_code}; refreshing auth before retry "
+                    f"Apollo page {page_id} returned HTTP {response.status_code}; retrying with configured auth "
                     f"({attempt}/{MAX_REQUEST_ATTEMPTS}).",
                     flush=True,
                 )
                 if response.status_code == 429:
                     pause = HTTP_429_PAUSES[min(attempt - 1, len(HTTP_429_PAUSES) - 1)]
-                    print(f"Waiting {pause:.0f}s before Apollo auth refresh and page retry.", flush=True)
+                    print(f"Waiting {pause:.0f}s before Apollo page retry.", flush=True)
                     time.sleep(pause)
-                auth_state["token"] = refresh_auth_token(
-                    session, category, bootstrap_token, auth_state["token"]
-                )
                 if response.status_code != 429:
                     time.sleep(random.uniform(*REQUEST_GAP_SECONDS))
                 continue
@@ -389,10 +338,11 @@ def scrape_category(
     session: requests.Session,
     category: dict[str, str],
     location: dict[str, Any],
-    auth_state: dict[str, str],
+    token: str,
 ) -> list[dict[str, str]]:
     try:
-        first = request_page(session, category, location, auth_state, 1)
+        warm_category_page(session, category, 1)
+        first = request_page(session, category, location, token, 1)
     except CategoryRequestAborted as error:
         reset_failure_counter()
         print(f"Skipping {category.get('name', category['slug'])} after consecutive request failures: {error}", flush=True)
@@ -407,7 +357,7 @@ def scrape_category(
         time.sleep(random.uniform(*REQUEST_GAP_SECONDS))
         try:
             warm_category_page(session, category, page_id)
-            page_payloads.append((page_id, request_page(session, category, location, auth_state, page_id)))
+            page_payloads.append((page_id, request_page(session, category, location, token, page_id)))
         except CategoryRequestAborted as error:
             reset_failure_counter()
             print(
@@ -446,9 +396,8 @@ def scrape_category(
     return rows
 
 
-def run_sample_payload_test() -> int:
+def run_sample_payload_test(verbose: bool = False) -> int:
     token = get_auth_token(load_config())
-    auth_state = {"bootstrap": token, "token": token}
     category = {
         "name": "Baby Care payload test",
         "slug": "baby-care",
@@ -462,7 +411,8 @@ def run_sample_payload_test() -> int:
     }
     with requests.Session() as session:
         try:
-            first = request_page(session, category, location, auth_state, 1)
+            warm_category_page(session, category, 1)
+            first = request_page(session, category, location, token, 1, verbose=verbose)
         except CategoryRequestAborted as error:
             print(f"Sample payload test stopped at page 1: {error}", flush=True)
             return 2
@@ -478,7 +428,7 @@ def run_sample_payload_test() -> int:
             time.sleep(random.uniform(*REQUEST_GAP_SECONDS))
             try:
                 warm_category_page(session, category, page_id)
-                result = request_page(session, category, location, auth_state, page_id)
+                result = request_page(session, category, location, token, page_id, verbose=verbose)
             except CategoryRequestAborted as error:
                 print(f"Sample payload test stopped at page {page_id}: {error}", flush=True)
                 return 2
@@ -496,9 +446,17 @@ def main() -> int:
     parser.add_argument(
         "--test-payload",
         action="store_true",
-        help="Send only the supplied baby-care page 1 sample request.",
+        help="Test the supplied baby-care payload over consecutive pages.",
     )
-    if parser.parse_args().test_payload:
+    parser.add_argument(
+        "--verbose-test-payload",
+        action="store_true",
+        help="Test the payload and print each complete prepared POST URL, headers, and JSON before sending.",
+    )
+    args = parser.parse_args()
+    if args.verbose_test_payload:
+        return run_sample_payload_test(verbose=True)
+    if args.test_payload:
         return run_sample_payload_test()
 
     global DISCOUNT_THRESHOLD
@@ -508,7 +466,6 @@ def main() -> int:
         threshold = DISCOUNT_THRESHOLD
     DISCOUNT_THRESHOLD = threshold
     token = get_auth_token(config)
-    auth_state = {"bootstrap": token, "token": token}
     location = get_location(config)
     if not all(location.get(key) not in (None, "") for key in ("lat", "lon", "pincode")):
         raise RuntimeError("Shared location must provide lat, lon, and pincode for Apollo Pharmacy.")
@@ -522,7 +479,7 @@ def main() -> int:
         for index, category in enumerate(categories, start=1):
             name = str(category.get("name") or category["slug"])
             print(f"\n[{index}/{len(categories)}] Scraping {name} ({category['slug']})", flush=True)
-            rows = scrape_category(session, category, location, auth_state)
+            rows = scrape_category(session, category, location, token)
             all_rows.extend(rows)
             print(f"{name}: qualifying products={len(rows)}", flush=True)
 
